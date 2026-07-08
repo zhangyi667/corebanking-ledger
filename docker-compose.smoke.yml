@@ -1,4 +1,7 @@
-name: corebanking-loadtest
+name: corebanking-smoke
+
+# Three services + independent Postgres per stateful service.
+# Sized for a 10-CPU / 16-GB Colima VM.
 
 services:
   kafka:
@@ -21,19 +24,71 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1.5G
 
-  postgres:
+  postgres-pm:
     image: postgres:16-alpine
     environment:
       POSTGRES_DB: posting_manager
       POSTGRES_USER: posting
       POSTGRES_PASSWORD: posting
-    command: ["postgres", "-c", "max_connections=300", "-c", "shared_buffers=512MB", "-c", "shared_preload_libraries=pg_stat_statements", "-c", "pg_stat_statements.track=all"]
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U posting"]
       interval: 5s
       timeout: 3s
       retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  postgres-acc:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: account_service
+      POSTGRES_USER: account
+      POSTGRES_PASSWORD: account
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=256MB"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U account"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  account-service:
+    build:
+      context: ../corebanking-account-service
+      dockerfile: Dockerfile
+    depends_on:
+      postgres-acc:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-acc:5432/account_service
+      SPRING_DATASOURCE_USERNAME: account
+      SPRING_DATASOURCE_PASSWORD: account
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "50"
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=70"
+    ports:
+      - "8082:8082"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
 
   posting-manager:
     build:
@@ -42,21 +97,24 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-      postgres:
+      postgres-pm:
         condition: service_healthy
+      account-service:
+        condition: service_started
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/posting_manager
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-pm:5432/posting_manager
       SPRING_DATASOURCE_USERNAME: posting
       SPRING_DATASOURCE_PASSWORD: posting
       SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseG1GC -XX:+ExitOnOutOfMemoryError"
+      POSTING_ACCOUNTS_BASE_URL: http://account-service:8082
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
     ports:
       - "8081:8081"
     deploy:
       resources:
         limits:
           cpus: "4.0"
-          memory: 1G
+          memory: 1.5G
 
   corebanking-ledger:
     build:
@@ -68,9 +126,8 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_CONSUMER_GROUP: corebanking-ledger
-      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75 -XX:+UseZGC"
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=75"
     deploy:
-      replicas: 3
       resources:
         limits:
           cpus: "1.0"
